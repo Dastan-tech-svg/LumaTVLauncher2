@@ -1,0 +1,34 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.lumatv.launcher'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.lumatv.launcher'
+        minSdk 21
+        targetSdk 32
+        versionCode 13
+        versionName '7.0'
+    }
+
+    buildTypes {
+        debug { minifyEnabled false }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+    // The old v4 Java file can remain in a GitHub repository after uploading the update.
+    // Main application code is now entirely in Kotlin (LumaHomeActivity.kt).
+    sourceSets { main { java { exclude '**/MainActivity.java' } } }
+}
