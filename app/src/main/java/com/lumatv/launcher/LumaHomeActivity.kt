@@ -1,6 +1,7 @@
 package com.lumatv.launcher
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.ResolveInfo
@@ -12,12 +13,15 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.net.Uri
+import android.net.ConnectivityManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.StatFs
 import android.provider.Settings
 import android.text.Editable
+import android.text.format.DateFormat
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.KeyEvent
@@ -30,6 +34,7 @@ import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
@@ -41,15 +46,17 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Luma TV 7.0 / luDOS 1.0. Native Android launcher without manufacturer locks.
+ * Luma TV 8.1 / luDOS 2.0. Native Android launcher without manufacturer locks.
  * Three visual profiles: LITE, BALANCED, ULTRA transparent glass.
  * No Compose, third-party SDKs, ads, network service, or background process.
  */
 class LumaHomeActivity : Activity() {
-    private enum class Page { HOME, APPS, WALLPAPERS, SETTINGS, QUICK, WELCOME }
+    private enum class Page { HOME, APPS, WALLPAPERS, SETTINGS, QUICK, WELCOME, HIDDEN, INFO, HELP }
     private enum class PerformanceMode { LITE, BALANCED, ULTRA }
-    private data class AppItem(val pkg: String, val label: String, val icon: Drawable, val launch: Intent)
+    private data class AppItem(val pkg: String, val label: String, val icon: Drawable,
+                               val launch: Intent, val isGame: Boolean, val isVideo: Boolean)
 
+    // Preserve v5/v7 preferences so updating APK keeps wallpapers and user choices.
     private val pref by lazy { getSharedPreferences("ludos_v5", MODE_PRIVATE) }
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var root: FrameLayout
@@ -68,13 +75,33 @@ class LumaHomeActivity : Activity() {
     private var blurredWallpaperIndex = Int.MIN_VALUE
     private var lastFocusedPackage: String? = null
     private var mainFocus: View? = null
+    private var menuVisible = false
     private val accents = intArrayOf(0xFF8BE7FF.toInt(), 0xFFC5A4FF.toInt(), 0xFF84F2CC.toInt(), 0xFFFFD18F.toInt())
     private val accentLabels = arrayOf("Арктический", "Аметист", "Мята", "Солнце")
-    private val wallpaperNames = arrayOf("Ночной олень", "Орёл в горах", "Лесная лиса", "Закат и лошади", "Полярный волк")
-    private val wallpaperIds = intArrayOf(R.drawable.wallpaper_deer, R.drawable.wallpaper_eagle,
-        R.drawable.wallpaper_fox, R.drawable.wallpaper_horses, R.drawable.wallpaper_wolf)
-    private val wallpaperThumbs = intArrayOf(R.drawable.thumb_deer, R.drawable.thumb_eagle,
-        R.drawable.thumb_fox, R.drawable.thumb_horses, R.drawable.thumb_wolf)
+    // luNature 2.0: nine offline wallpapers. No file-picker dependency.
+    private val wallpaperNames = arrayOf(
+        "Ночной олень", "Орёл в горах", "Лесная лиса", "Закат и лошади", "Полярный волк",
+        "Горное озеро", "Пурпурный градиент", "Морской градиент", "Закатный градиент"
+    )
+    private val wallpaperIds = intArrayOf(
+        R.drawable.wallpaper_deer, R.drawable.wallpaper_eagle,
+        R.drawable.wallpaper_fox, R.drawable.wallpaper_horses, R.drawable.wallpaper_wolf,
+        R.drawable.wallpaper_lake, R.drawable.wallpaper_aurora,
+        R.drawable.wallpaper_ocean, R.drawable.wallpaper_sunset
+    )
+    private val wallpaperThumbs = intArrayOf(
+        R.drawable.thumb_deer, R.drawable.thumb_eagle,
+        R.drawable.thumb_fox, R.drawable.thumb_horses, R.drawable.thumb_wolf,
+        R.drawable.thumb_lake, R.drawable.thumb_aurora,
+        R.drawable.thumb_ocean, R.drawable.thumb_sunset
+    )
+    private val wallpaperAccent = intArrayOf(1, 0, 2, 3, 0, 0, 1, 2, 3)
+    // Ready-made 320×180 blur resources: no expensive blur loop on the UI thread.
+    private val wallpaperBlurIds = intArrayOf(
+        R.drawable.blur_deer, R.drawable.blur_eagle, R.drawable.blur_fox,
+        R.drawable.blur_horses, R.drawable.blur_wolf, R.drawable.blur_lake,
+        R.drawable.blur_aurora, R.drawable.blur_ocean, R.drawable.blur_sunset
+    )
 
     private val showAmbient = Runnable {
         if (page == Page.HOME && !ambient) {
@@ -132,17 +159,24 @@ class LumaHomeActivity : Activity() {
         } else {
             render(Page.HOME)
         }
-        handler.post(tick)
     }
 
     override fun onResume() {
         super.onResume()
         fullscreen()
         wakeAmbient()
+        // Only update the clock while the launcher is visible.
+        handler.removeCallbacks(tick)
+        handler.post(tick)
         if (page == Page.HOME) resetAmbientTimer()
+        if (page == Page.APPS && System.currentTimeMillis() - lastAppsLoad > 120_000L) {
+            listOfApps(force = true)
+            render(Page.APPS)
+        }
     }
 
     override fun onPause() {
+        handler.removeCallbacks(tick)
         handler.removeCallbacks(showAmbient)
         super.onPause()
     }
@@ -150,6 +184,7 @@ class LumaHomeActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacks(tick)
         handler.removeCallbacks(showAmbient)
+        blurCache = null
         super.onDestroy()
     }
 
@@ -180,7 +215,15 @@ class LumaHomeActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
     private fun screenDp(): Int = (resources.displayMetrics.widthPixels / resources.displayMetrics.density).toInt()
-    private fun accent(): Int = accents[pref.getInt("accent", 0).coerceIn(0, accents.lastIndex)]
+    private fun accent(): Int {
+        val i = if (pref.getBoolean("adaptive_color", false)) {
+            wallpaperAccent[pref.getInt("wallpaper", 0).coerceIn(wallpaperAccent.indices)]
+        } else pref.getInt("accent", 0).coerceIn(0, accents.lastIndex)
+        return accents[i]
+    }
+    private fun motionEnabled(): Boolean = pref.getBoolean("motion_enabled", true)
+    private fun motionFactor(): Float = (pref.getInt("motion_speed", 100).coerceIn(50, 160) / 100f)
+    private fun transparency(): Int = pref.getInt("glass_transparency", 65).coerceIn(0, 100)
     /** Read old v5 settings once without resetting the user's preferences. */
     private fun performanceMode(): PerformanceMode {
         return when (pref.getString("performance_mode", null)) {
@@ -211,13 +254,25 @@ class LumaHomeActivity : Activity() {
         }
         tintOverlay.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, shades)
     }
-    private fun clockText() = SimpleDateFormat("HH:mm", Locale("ru", "RU")).format(Date())
+    private fun clockText(): String {
+        val is24h = when (pref.getString("clock_mode", "system")) {
+            "24" -> true
+            "12" -> false
+            else -> DateFormat.is24HourFormat(this)
+        }
+        return SimpleDateFormat(if (is24h) "HH:mm" else "hh:mm a", Locale("ru", "RU")).format(Date())
+    }
     private fun dateText() = SimpleDateFormat("EEEE, d MMMM", Locale("ru", "RU")).format(Date())
+    private fun textScale(): Float = when (pref.getInt("text_scale", 100)) {
+        115 -> 1.15f
+        130 -> 1.30f
+        else -> 1f
+    }
 
     private fun label(text: String, size: Float, color: Int = Color.WHITE, bold: Boolean = false): TextView =
         TextView(this).apply {
             this.text = text
-            textSize = size
+            textSize = size * textScale()
             setTextColor(color)
             includeFontPadding = false
             setSingleLine(false)
@@ -225,14 +280,15 @@ class LumaHomeActivity : Activity() {
         }
 
     /**
-     * luGlass 7: light native drawables, no native blur SDK or third-party renderer.
+     * luGlass 8: light native drawables, no native blur SDK or third-party renderer.
      * The ULTRA fill is deliberately close to transparent, showing the actual
      * wallpaper below it. Dialogs remain dark enough to read against bright photos.
      */
     private fun glass(selected: Boolean = false, radius: Float = 24f, opaque: Boolean = false): Drawable {
         val mode = performanceMode()
+        val forceOpaque = opaque || pref.getBoolean("high_contrast", false)
         val colors = when {
-            opaque -> when (mode) {
+            forceOpaque -> when (mode) {
                 PerformanceMode.LITE -> intArrayOf(0xEE233A54.toInt(), 0xF00A1A32.toInt())
                 PerformanceMode.BALANCED -> intArrayOf(0xD3294867.toInt(), 0xE30C1A33.toInt())
                 PerformanceMode.ULTRA -> intArrayOf(0xA429496D.toInt(), 0xBE08172D.toInt())
@@ -270,81 +326,36 @@ class LumaHomeActivity : Activity() {
     }
     private fun colorWithAlpha(c: Int, alpha: Int): Int = (c and 0x00FFFFFF) or ((alpha and 0xFF) shl 24)
 
-    /** Cached 320x180 wallpaper frosting is calculated once per wallpaper.
-     * Unlike RenderEffect (Android 12+), this works on Android 5+ too.
-     * ULTRA is opt-in. No background processing loop is used.
+    /**
+     * Resource blur is created at build time, so pressing OK / changing focus never
+     * runs a pixel-by-pixel blur on the television's main thread.
      */
     private fun ultraBlurredWallpaper(): Bitmap? {
         if (performanceMode() != PerformanceMode.ULTRA) return null
-        val wallpaper = pref.getInt("wallpaper", 0)
-        if (blurredWallpaperIndex == wallpaper && blurCache != null) return blurCache
+        val selected = pref.getInt("wallpaper", 0).coerceIn(wallpaperBlurIds.indices)
+        if (blurredWallpaperIndex == selected && blurCache != null) return blurCache
         return try {
-            val options = BitmapFactory.Options().apply {
-                inPreferredConfig = Bitmap.Config.ARGB_8888
-                inSampleSize = 4
-            }
-            val bitmap = if (wallpaper == -1) {
-                BitmapFactory.decodeFile(File(filesDir, "luma_wallpaper_custom.jpg").absolutePath, options)
-            } else {
-                BitmapFactory.decodeResource(resources, wallpaperIds[wallpaper.coerceIn(wallpaperIds.indices)], options)
-            } ?: return null
-            val resized = Bitmap.createScaledBitmap(bitmap, 320, 180, true)
-            if (bitmap !== resized) bitmap.recycle()
-            val result = frostedBitmap(resized, 6)
-            if (resized !== result) resized.recycle()
-            blurCache = result
-            blurredWallpaperIndex = wallpaper
-            result
-        } catch (_: Exception) { null } // Unsupported decoder/low memory -> gradient fallback.
-    }
-
-    /** Two-pass bounded box blur; ~230 KiB per cached result, no RenderScript dependency. */
-    private fun frostedBitmap(source: Bitmap, radius: Int): Bitmap {
-        val w = source.width
-        val h = source.height
-        val pixels = IntArray(w * h)
-        val intermediate = IntArray(pixels.size)
-        val output = IntArray(pixels.size)
-        source.getPixels(pixels, 0, w, 0, 0, w, h)
-        val diameter = radius * 2 + 1
-        for (y in 0 until h) {
-            val base = y * w
-            for (x in 0 until w) {
-                var red = 0; var green = 0; var blue = 0
-                for (offset in -radius..radius) {
-                    val value = pixels[base + (x + offset).coerceIn(0, w - 1)]
-                    red += (value ushr 16) and 255
-                    green += (value ushr 8) and 255
-                    blue += value and 255
-                }
-                intermediate[base + x] = (0xFF shl 24) or ((red / diameter) shl 16) or
-                    ((green / diameter) shl 8) or (blue / diameter)
-            }
-        }
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                var red = 0; var green = 0; var blue = 0
-                for (offset in -radius..radius) {
-                    val value = intermediate[(y + offset).coerceIn(0, h - 1) * w + x]
-                    red += (value ushr 16) and 255
-                    green += (value ushr 8) and 255
-                    blue += value and 255
-                }
-                output[y * w + x] = (0xFF shl 24) or ((red / diameter) shl 16) or
-                    ((green / diameter) shl 8) or (blue / diameter)
-            }
-        }
-        return Bitmap.createBitmap(output, w, h, Bitmap.Config.ARGB_8888)
+            val bmp = BitmapFactory.decodeResource(resources, wallpaperBlurIds[selected],
+                BitmapFactory.Options().apply {
+                    inScaled = false
+                    inPreferredConfig = Bitmap.Config.RGB_565
+                }) ?: return null
+            blurCache = bmp
+            blurredWallpaperIndex = selected
+            bmp
+        } catch (_: OutOfMemoryError) {
+            null // ULTRA gracefully falls back to a gradient on a memory-limited TV.
+        } catch (_: Exception) { null }
     }
 
     private fun focusGlass(owner: View, selected: Boolean, radius: Float): Drawable {
-        return if (performanceMode() == PerformanceMode.ULTRA) {
-            LuGlassDrawable(owner, dp(radius.toInt()).toFloat(), selected, accent(), ultraBlurredWallpaper())
+        return if (performanceMode() == PerformanceMode.ULTRA && !pref.getBoolean("high_contrast", false)) {
+            LuGlassDrawable(owner, dp(radius.toInt()).toFloat(), selected, accent(), ultraBlurredWallpaper(), transparency = transparency())
         } else glass(selected, radius)
     }
 
     /**
-     * luDOS 7.0: focus scale must be allowed to extend beyond a tile's original rectangle.
+     * luDOS 2.0: focus scale must be allowed to extend beyond a tile's original rectangle.
      * All ancestor rows/scroll containers use clipChildren=false and reserve safe gutters.
      */
     private fun focusableGlass(view: View, radius: Float = 22f, selected: Boolean = false,
@@ -359,22 +370,21 @@ class LumaHomeActivity : Activity() {
             v.animate().cancel()  // Don't let a previous focus animation keep scaling after focus moves.
             v.background = focusGlass(v, gained || selected, radius)
             v.elevation = dp(if (gained) 14 else 0).toFloat()
-            when (performanceMode()) {
-                PerformanceMode.LITE -> {
-                    // No scale animation on devices that need maximum responsiveness.
-                    v.scaleX = 1f
-                    v.scaleY = 1f
-                }
-                PerformanceMode.BALANCED, PerformanceMode.ULTRA -> {
-                    // Reserve space around every row so focus never cuts card corners.
-                    val factor = if (performanceMode() == PerformanceMode.ULTRA) 1.0f else 0.6f
-                    val zoom = 1f + (focusScale - 1f) * factor
-                    val scale = if (gained) zoom else 1f
-                    val duration = if (performanceMode() == PerformanceMode.ULTRA) 255L else 130L
-                    v.animate().scaleX(scale).scaleY(scale)
-                        .translationZ(if (gained) dp(11).toFloat() else 0f)
-                        .setDuration(duration).setInterpolator(DecelerateInterpolator()).start()
-                }
+            if (performanceMode() == PerformanceMode.LITE || !motionEnabled()) {
+                // Stable no-motion mode: reset all properties, including after a profile change.
+                v.scaleX = 1f; v.scaleY = 1f
+                v.translationY = 0f; v.translationZ = 0f
+            } else {
+                // luMotion 2.0: gentle focus lift; NO overshoot, capped zoom and safe gutters.
+                val level = if (performanceMode() == PerformanceMode.ULTRA) 1f else 0.65f
+                val zoom = 1f + (focusScale - 1f).coerceIn(0.01f, 0.065f) * level
+                val scale = if (gained) zoom else 1f
+                val duration = (((if (performanceMode() == PerformanceMode.ULTRA) 265 else 170) *
+                    motionFactor()).toLong()).coerceIn(90L, 460L)
+                v.animate().scaleX(scale).scaleY(scale)
+                    .translationY(if (gained) -dp(2).toFloat() else 0f)
+                    .translationZ(if (gained) dp(10).toFloat() else 0f)
+                    .setDuration(duration).setInterpolator(DecelerateInterpolator()).start()
             }
         }
     }
@@ -424,14 +434,30 @@ class LumaHomeActivity : Activity() {
             Page.SETTINGS -> settingsPage()
             Page.QUICK -> quickPanel()
             Page.WELCOME -> welcome()
+            Page.HIDDEN -> hiddenAppsPage()
+            Page.INFO -> systemInfoPage()
+            Page.HELP -> helpPage()
         }
         resetAmbientTimer()
+        // luMotion 2.0 page entrance. Animates container only; no image decoding on a frame.
+        if (performanceMode() != PerformanceMode.LITE && motionEnabled() &&
+            pref.getBoolean("page_transitions", true) && next != Page.WELCOME) {
+            shell.animate().cancel()
+            shell.alpha = 0.7f
+            shell.translationY = dp(7).toFloat()
+            shell.animate().alpha(1f).translationY(0f)
+                .setDuration((220 * motionFactor()).toLong().coerceAtLeast(100L))
+                .setInterpolator(DecelerateInterpolator()).start()
+        }
         mainFocus?.let { focus -> focus.post { if (focus.isAttachedToWindow) focus.requestFocus() } }
     }
 
     private fun resetAmbientTimer() {
         handler.removeCallbacks(showAmbient)
-        if (page == Page.HOME && pref.getBoolean("ambient", true)) handler.postDelayed(showAmbient, 90_000)
+        if (page == Page.HOME && pref.getBoolean("ambient", true)) {
+            val idleSeconds = pref.getInt("ambient_delay", 90).coerceIn(30, 600)
+            handler.postDelayed(showAmbient, idleSeconds * 1000L)
+        }
     }
 
     private fun wakeAmbient() {
@@ -464,7 +490,7 @@ class LumaHomeActivity : Activity() {
             heading.addView(spacing(10))
             heading.addView(chip("⚙") { render(Page.QUICK) }, LinearLayout.LayoutParams(dp(55), dp(45)))
         } else {
-            heading.addView(label("luDOS 1.0", 14f, 0xFFC7D4EA.toInt()))
+            heading.addView(label("luDOS 2.0", 14f, 0xFFC7D4EA.toInt()))
         }
         body.addView(heading, LinearLayout.LayoutParams(-1, dp(48)))
         body.addView(space(22))
@@ -519,8 +545,14 @@ class LumaHomeActivity : Activity() {
                     .setClassName(pkg, ri.activityInfo.name)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
                 val launch = pm.getLeanbackLaunchIntentForPackage(pkg) ?: pm.getLaunchIntentForPackage(pkg) ?: explicit
-                AppItem(pkg, ri.loadLabel(pm)?.toString()?.trim()?.ifBlank { pkg } ?: pkg,
-                    ri.loadIcon(pm), launch)
+                val title = ri.loadLabel(pm)?.toString()?.trim()?.ifBlank { pkg } ?: pkg
+                val info = ri.activityInfo.applicationInfo
+                val game = if (Build.VERSION.SDK_INT >= 26) {
+                    info.category == ApplicationInfo.CATEGORY_GAME
+                } else {
+                    (info.flags and ApplicationInfo.FLAG_IS_GAME) != 0
+                }
+                AppItem(pkg, title, ri.loadIcon(pm), launch, game, LuAppRules.isVideo(pkg, title))
             } catch (_: Exception) { null }
         }
         allAppsCache = items.sortedWith(compareBy<AppItem> { priority(it.pkg, it.label) }.thenBy { it.label.lowercase(Locale.ROOT) })
@@ -555,12 +587,30 @@ class LumaHomeActivity : Activity() {
         }
     }
 
-    private fun hidden(): Set<String> = pref.getString("hidden", "")!!.split('|').filter { it.isNotBlank() }.toSet()
-    private fun recents(): MutableList<String> = pref.getString("recents", "")!!.split('|').filter { it.isNotBlank() }.toMutableList()
+    private fun hidden(): Set<String> = pref.getString("hidden", "").orEmpty().split('|').filter { it.isNotBlank() }.toSet()
+    private fun recents(): MutableList<String> = pref.getString("recents", "").orEmpty().split('|').filter { it.isNotBlank() }.toMutableList()
     private fun saveRecents(items: List<String>) = pref.edit().putString("recents", items.distinct().take(12).joinToString("|")).apply()
+    private fun pinned(): MutableList<String> = if (pref.contains("pinned")) {
+        pref.getString("pinned", "").orEmpty().split('|').filter { it.isNotBlank() }.toMutableList()
+    } else listOfApps().filter { it.pkg !in hidden() }.take(5).map { it.pkg }.toMutableList()
+    private fun savePinned(items: List<String>) = pref.edit().putString("pinned", items.distinct().take(16).joinToString("|")).apply()
+    private fun launchCount(pkg: String): Int = pref.getInt("launches_$pkg", 0)
+    private fun sortedApps(items: List<AppItem>): List<AppItem> {
+        val recentOrder = recents()
+        return when (pref.getString("apps_sort", "smart")) {
+            "az" -> items.sortedBy { it.label.lowercase(Locale.ROOT) }
+            "za" -> items.sortedByDescending { it.label.lowercase(Locale.ROOT) }
+            "recent" -> items.sortedWith(compareBy<AppItem> {
+                recentOrder.indexOf(it.pkg).let { n -> if (n < 0) 100_000 else n }
+            }.thenBy { it.label.lowercase(Locale.ROOT) })
+            "frequent" -> items.sortedWith(compareByDescending<AppItem> { launchCount(it.pkg) }
+                .thenBy { it.label.lowercase(Locale.ROOT) })
+            else -> items // YouTube and Google Play are already promoted by priority().
+        }
+    }
 
     /**
-     * luHome 7.0 Glass Update — cinematic but functional.
+     * luHome 2.0 Glass Update — cinematic but functional.
      * There are no fake movie suggestions, weather readings or dead buttons:
      * every glass card performs an action on the actual TV.
      */
@@ -583,10 +633,25 @@ class LumaHomeActivity : Activity() {
             body.addView(space(12))
             body.addView(status, LinearLayout.LayoutParams(-1, dp(116)))
         }
-        body.addView(space(21))
+        body.addView(space(13))
+        val shortcuts = row()
+        val tiles = listOf(
+            "▦  Все приложения" to { render(Page.APPS) },
+            "◈  luStudio" to { render(Page.SETTINGS) },
+            "▧  ${wallpaperIds.size} обоев" to { render(Page.WALLPAPERS) },
+            "⚙  luControl" to { render(Page.QUICK) }
+        )
+        tiles.forEachIndexed { index, (name, action) ->
+            shortcuts.addView(chip(name, action), LinearLayout.LayoutParams(0, dp(49), 1f))
+            if (index < tiles.lastIndex) shortcuts.addView(spacing(12))
+        }
+        body.addView(shortcuts)
+        body.addView(space(18))
 
-        body.addView(section("✦  Приложения"))
-        val topApps = listOfApps().filter { !hidden().contains(it.pkg) }.take(5)
+        body.addView(section("✦  Главные приложения"))
+        val availableApps = listOfApps().filter { it.pkg !in hidden() }
+        val chosen = pinned()
+        val topApps = chosen.mapNotNull { pkg -> availableApps.firstOrNull { it.pkg == pkg } }.take(8)
         val mainRow = row()
         mainFocus = null
         for (item in topApps) {
@@ -635,7 +700,7 @@ class LumaHomeActivity : Activity() {
         quickRow.addView(spacing(12))
         quickRow.addView(chip("⚙  Настройки") { render(Page.SETTINGS) }, LinearLayout.LayoutParams(dp(170), dp(48)))
         quickRow.addView(spacing(12))
-        quickRow.addView(chip("⚡  " + performanceName()) { render(Page.SETTINGS) },
+        quickRow.addView(chip("ⓘ  Помощь / пульт") { render(Page.HELP) },
             LinearLayout.LayoutParams(dp(146), dp(48)))
         body.addView(quickRow)
         body.addView(space(25))
@@ -678,7 +743,7 @@ class LumaHomeActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(25), dp(18), dp(20), dp(17))
         }
-        status.addView(label("LU•DOS 1.0   /   " + performanceName(), 12f, accent(), true))
+        status.addView(label("LU•DOS 2.0   /   " + performanceName(), 12f, accent(), true))
         status.addView(space(5))
         heroClock = label(clockText(), 47f, Color.WHITE, true).also { status.addView(it) }
         status.addView(space(2))
@@ -717,7 +782,7 @@ class LumaHomeActivity : Activity() {
         clipChildren = false
         clipToPadding = false
         overScrollMode = View.OVER_SCROLL_NEVER
-        // luDOS 7.0: free space is required around the first/last focused tile and its shadow.
+        // luDOS 2.0: free space is required around the first/last focused tile and its shadow.
         setPadding(dp(14), dp(12), dp(14), dp(12))
         addView(content)
     }
@@ -758,38 +823,40 @@ class LumaHomeActivity : Activity() {
 
     private fun launchApp(app: AppItem) {
         try {
+            startActivity(app.launch)
+            // Only store a successful launch, never a missing/unavailable activity.
+            val uses = launchCount(app.pkg)
+            pref.edit().putInt("launches_${app.pkg}", (uses + 1).coerceAtMost(999_999)).apply()
             val r = recents()
             r.remove(app.pkg)
             r.add(0, app.pkg)
             saveRecents(r)
             lastFocusedPackage = app.pkg
-            startActivity(app.launch)
         } catch (_: Exception) {
             Toast.makeText(this, "Приложение не удалось открыть", Toast.LENGTH_LONG).show()
         }
     }
 
+    /** luApps 2.1: search, sorting, categories and paged grids for large libraries. */
     private fun allApps() {
         val body = pageContent()
         header(body, "Все приложения", back = true)
-        val visible = listOfApps().filter { !hidden().contains(it.pkg) }
+        val visible = listOfApps().filter { it.pkg !in hidden() }
         val top = row()
-        val info = label("${visible.size} приложений   •   Удерживай OK для действий", 15f, 0xFFE4EDFF.toInt())
-        top.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+        top.addView(label("${visible.size} приложений · Долгое OK — действия", 14f,
+            0xFFE4EDFF.toInt()), LinearLayout.LayoutParams(0, -2, 1f))
         top.addView(chip("↻ Обновить") {
             listOfApps(force = true)
             render(Page.APPS)
-        }, LinearLayout.LayoutParams(dp(144), dp(44)))
+        }, LinearLayout.LayoutParams(dp(140), dp(44)))
         top.addView(spacing(10))
-        top.addView(chip("Вернуть скрытые") {
-            pref.edit().remove("hidden").apply()
-            render(Page.APPS)
-        }, LinearLayout.LayoutParams(dp(180), dp(44)))
+        top.addView(chip("Скрытые (${hidden().size})") { render(Page.HIDDEN) },
+            LinearLayout.LayoutParams(dp(172), dp(44)))
         body.addView(top)
-        body.addView(space(15))
+        body.addView(space(14))
         val search = EditText(this).apply {
             hint = "Поиск приложений..."
-            textSize = 17f
+            textSize = 17f * textScale()
             setSingleLine(true)
             setTextColor(Color.WHITE)
             setHintTextColor(0xFFAFBED0.toInt())
@@ -797,48 +864,187 @@ class LumaHomeActivity : Activity() {
             background = glass(radius = 18f)
             imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
         }
-        body.addView(search, LinearLayout.LayoutParams(-1, dp(48)))
-        body.addView(space(20))
+        body.addView(search, LinearLayout.LayoutParams(-1, dp(49)))
+        body.addView(space(13))
+        val controls = row()
+        controls.addView(chip("⇅  Сортировка") { chooseAppSort() },
+            LinearLayout.LayoutParams(dp(184), dp(48)))
+        controls.addView(spacing(12))
+        val filterChips = mutableListOf<Pair<String, TextView>>()
+        var activeFilter = "all"
+        var pageSize = 48
+        val filterNames = listOf(
+            "all" to "Все", "video" to "Видео", "games" to "Игры", "other" to "Другие"
+        )
         val holder = column()
-        body.addView(holder)
         val columns = max(3, min(6, (screenDp() - 90) / 160))
+
         fun redraw(term: String) {
             holder.removeAllViews()
-            val list = visible.filter { term.isBlank() || it.label.contains(term, ignoreCase = true) }
-            for (batch in list.chunked(columns)) {
-                val r = row().apply { setPadding(dp(11), dp(9), dp(11), dp(9)) }
-                batch.forEach {
-                    r.addView(appTile(it, false), LinearLayout.LayoutParams(0, dp(99), 1f))
-                    r.addView(spacing(10))
+            val chosen = sortedApps(visible).filter { item ->
+                LuAppRules.filterLabel(item.label, term) && when (activeFilter) {
+                    "video" -> item.isVideo
+                    "games" -> item.isGame
+                    "other" -> !item.isVideo && !item.isGame
+                    else -> true
                 }
-                repeat(columns - batch.size) { r.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f)); r.addView(spacing(10)) }
-                holder.addView(r, LinearLayout.LayoutParams(-1, dp(120)))
             }
-            if (list.isEmpty()) holder.addView(label("Ничего не найдено", 19f, 0xFFE0E8F6.toInt()))
+            for (batch in chosen.take(pageSize).chunked(columns)) {
+                val r = row().apply { setPadding(dp(12), dp(10), dp(12), dp(10)) }
+                batch.forEachIndexed { position, item ->
+                    r.addView(appTile(item, false), LinearLayout.LayoutParams(0, dp(99), 1f))
+                    if (position < columns - 1) r.addView(spacing(10))
+                }
+                repeat(columns - batch.size) {
+                    r.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+                    if (batch.size + it < columns - 1) r.addView(spacing(10))
+                }
+                holder.addView(r, LinearLayout.LayoutParams(-1, dp(119)))
+            }
+            if (chosen.isEmpty()) holder.addView(label("Ничего не найдено", 19f,
+                0xFFE0E8F6.toInt()))
+            if (chosen.size > pageSize) {
+                val more = chip("Показать ещё (${chosen.size - pageSize}) ↓") {
+                    pageSize += 48
+                    redraw(search.text?.toString().orEmpty())
+                }
+                holder.addView(more, LinearLayout.LayoutParams(-1, dp(51)))
+            }
         }
+        filterNames.forEach { (key, title) ->
+            val v = chip((if (key == activeFilter) "● " else "") + title) {
+                activeFilter = key
+                pageSize = 48
+                filterChips.forEach { (filter, view) ->
+                    view.text = (if (filter == activeFilter) "● " else "") +
+                        (filterNames.firstOrNull { it.first == filter }?.second ?: filter)
+                }
+                redraw(search.text?.toString().orEmpty())
+            }
+            controls.addView(v, LinearLayout.LayoutParams(0, dp(48), 1f))
+            controls.addView(spacing(8))
+            filterChips.add(key to v)
+        }
+        body.addView(controls)
+        body.addView(space(12))
+        body.addView(holder)
         redraw("")
         search.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { redraw(s?.toString().orEmpty()) }
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                pageSize = 48
+                redraw(s?.toString().orEmpty())
+            }
             override fun afterTextChanged(s: Editable?) = Unit
         })
-        mainFocus = holder.findFocus() ?: top.getChildAt(1)
+        mainFocus = top.getChildAt(1)
+    }
+
+    private fun chooseAppSort() {
+        customMenu("Сортировка приложений", listOf(
+            "Умная (YouTube и Play Маркет первыми)" to { setAppSort("smart") },
+            "По алфавиту А—Я" to { setAppSort("az") },
+            "По алфавиту Я—А" to { setAppSort("za") },
+            "Недавно открытые" to { setAppSort("recent") },
+            "Часто открываемые" to { setAppSort("frequent") }
+        ))
+    }
+    private fun setAppSort(code: String) {
+        pref.edit().putString("apps_sort", code).apply()
+        render(Page.APPS)
+    }
+
+    private fun hiddenAppsPage() {
+        val body = pageContent()
+        header(body, "Скрытые приложения", back = true)
+        body.addView(label("Здесь можно восстановить отдельные программы. Системные службы не показываются.",
+            16f, 0xFFE5EEFF.toInt()))
+        body.addView(space(17))
+        val hiddenSet = hidden()
+        val all = listOfApps()
+        val hiddenApps = all.filter { it.pkg in hiddenSet }
+        var firstAction: View? = null
+        if (hiddenApps.isEmpty()) {
+            body.addView(label("Пока нет скрытых приложений.", 19f))
+        } else {
+            for (item in hiddenApps) {
+                val button = chip("↩  Показать: ${item.label}") {
+                    pref.edit().putString("hidden", (hiddenSet - item.pkg).joinToString("|")).apply()
+                    render(Page.HIDDEN)
+                }
+                if (firstAction == null) firstAction = button
+                body.addView(button, LinearLayout.LayoutParams(-1, dp(56)))
+                body.addView(space(9))
+            }
+            body.addView(space(13))
+            body.addView(chip("Восстановить все скрытые") {
+                customMenu("Вернуть приложения?", listOf(
+                    "Да, восстановить все" to { pref.edit().remove("hidden").apply(); render(Page.HIDDEN) },
+                    "Отмена" to { render(Page.HIDDEN) }
+                ))
+            }, LinearLayout.LayoutParams(-1, dp(55)))
+        }
+        mainFocus = firstAction ?: (body.getChildAt(0) as? ViewGroup)?.getChildAt(0)
     }
 
     private fun showAppActions(item: AppItem) {
         val actions = mutableListOf<Pair<String, () -> Unit>>()
+        val current = pinned()
+        if (item.pkg !in current) {
+            actions.add("＋ Добавить на главный экран" to {
+                val next = pinned()
+                next.add(item.pkg)
+                savePinned(next)
+                render(page)
+            })
+        } else {
+            actions.add("− Убрать с главного экрана" to {
+                savePinned(pinned().filter { it != item.pkg }); render(page)
+            })
+            actions.add("↑ Поставить первым на главном" to {
+                val next = pinned().apply { remove(item.pkg); add(0, item.pkg) }
+                savePinned(next); render(page)
+            })
+            val index = current.indexOf(item.pkg)
+            if (index > 0) actions.add("← Сдвинуть влево" to {
+                val next = pinned()
+                val i = next.indexOf(item.pkg)
+                if (i > 0) java.util.Collections.swap(next, i, i - 1)
+                savePinned(next); render(page)
+            })
+            if (index in 0 until current.lastIndex) actions.add("→ Сдвинуть вправо" to {
+                val next = pinned()
+                val i = next.indexOf(item.pkg)
+                if (i >= 0 && i < next.lastIndex) java.util.Collections.swap(next, i, i + 1)
+                savePinned(next); render(page)
+            })
+        }
         actions.add("◉ Скрыть из списка" to {
             val set = hidden().toMutableSet(); set.add(item.pkg)
-            pref.edit().putString("hidden", set.joinToString("|")).apply(); render(page)
+            pref.edit().putString("hidden", set.joinToString("|")).apply()
+            // Remove hidden item from the custom home row as well.
+            savePinned(pinned().filter { it != item.pkg })
+            render(page)
         })
         actions.add("ⓘ Информация о приложении" to {
             openSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${item.pkg}"))
+        })
+        actions.add("Удалить приложение (через Android)" to {
+            try {
+                startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${item.pkg}")))
+            } catch (_: Exception) {
+                Toast.makeText(this, "Удаление недоступно на устройстве", Toast.LENGTH_SHORT).show()
+            }
         })
         customMenu(item.label, actions)
     }
 
     private fun customMenu(title: String, actions: List<Pair<String, () -> Unit>>) {
+        // Long-press OK may generate repeated key events on some TV remotes.
+        if (menuVisible) return
+        menuVisible = true
         val dialog = android.app.Dialog(this, android.R.style.Theme_Translucent_NoTitleBar_Fullscreen)
+        dialog.setOnDismissListener { menuVisible = false }
         val lay = FrameLayout(this).apply { setBackgroundColor(0xB5000817.toInt()) }
         val box = column().apply { setPadding(dp(23), dp(23), dp(23), dp(23)); background = glass(opaque = true) }
         box.addView(label(title, 22f, Color.WHITE, true))
@@ -865,8 +1071,29 @@ class LumaHomeActivity : Activity() {
     private fun wallpaperPage() {
         val body = pageContent()
         header(body, "Обои — luNature", back = true)
-        body.addView(label("Выбери один из пяти пейзажей Luma TV.", 16f,
+        body.addView(label("Коллекция Luma TV: ${wallpaperIds.size} обоев — природа и градиенты.", 16f,
             0xFFE1E8F4.toInt()))
+        body.addView(space(12))
+        val wallpaperTools = row()
+        wallpaperTools.addView(chip("⤨  Случайные обои") {
+            val chosen = (0 until wallpaperIds.size).random()
+            pref.edit().putInt("wallpaper", chosen).apply()
+            refreshBackground()
+            render(Page.WALLPAPERS)
+        }, LinearLayout.LayoutParams(0, dp(49), 1f))
+        wallpaperTools.addView(spacing(12))
+        wallpaperTools.addView(chip("→  Следующие обои") {
+            val current = pref.getInt("wallpaper", 0).coerceAtLeast(0)
+            pref.edit().putInt("wallpaper", (current + 1) % wallpaperIds.size).apply()
+            refreshBackground()
+            render(Page.WALLPAPERS)
+        }, LinearLayout.LayoutParams(0, dp(49), 1f))
+        wallpaperTools.addView(spacing(12))
+        wallpaperTools.addView(chip("Автосмена: " + if (pref.getBoolean("wallpaper_auto", false)) "ВКЛ" else "ВЫКЛ") {
+            pref.edit().putBoolean("wallpaper_auto", !pref.getBoolean("wallpaper_auto", false)).apply()
+            render(Page.WALLPAPERS)
+        }, LinearLayout.LayoutParams(0, dp(49), 1f))
+        body.addView(wallpaperTools)
         body.addView(space(19))
         val selected = pref.getInt("wallpaper", 0)
         val countColumns = if (screenDp() > 950) 3 else 2
@@ -935,7 +1162,7 @@ class LumaHomeActivity : Activity() {
         val colorRow = row()
         for (i in accentLabels.indices) {
             val theme = chip((if (pref.getInt("accent", 0) == i) "✓ " else "") + accentLabels[i]) {
-                pref.edit().putInt("accent", i).apply(); render(Page.SETTINGS)
+                pref.edit().putInt("accent", i).putBoolean("adaptive_color", false).apply(); render(Page.SETTINGS)
             }
             colorRow.addView(theme, LinearLayout.LayoutParams(0, dp(54), 1f))
             colorRow.addView(spacing(10))
@@ -945,9 +1172,9 @@ class LumaHomeActivity : Activity() {
         body.addView(section("Режимы luGlass / Производительность"))
         val perf = row()
         val profiles = listOf(
-            Triple(PerformanceMode.LITE, "LITE", "Для слабых ТВ"),
-            Triple(PerformanceMode.BALANCED, "BALANCED", "Для средних ТВ"),
-            Triple(PerformanceMode.ULTRA, "ULTRA", "Для мощных ТВ")
+            Triple(PerformanceMode.LITE, "LITE", "Меньше эффектов"),
+            Triple(PerformanceMode.BALANCED, "BALANCED", "Баланс"),
+            Triple(PerformanceMode.ULTRA, "ULTRA", "Максимум эффектов")
         )
         profiles.forEachIndexed { index, (mode, name, details) ->
             val txt = (if (performanceMode() == mode) "✓ " else "") + "$name\n$details"
@@ -964,6 +1191,60 @@ class LumaHomeActivity : Activity() {
             "ULTRA — фон с настоящим статическим размытием внутри карточек, " +
             "объёмные блики и световые контуры. Это не динамический эффект iOS.",
             13f, 0xFFE9F4FF.toInt()))
+        body.addView(space(20))
+        body.addView(section("luStudio — настройка стекла и движения"))
+        val adaptive = chip("◈  Подбирать цвет под обои: " +
+            if (pref.getBoolean("adaptive_color", false)) "ВКЛ" else "ВЫКЛ") {
+            pref.edit().putBoolean("adaptive_color", !pref.getBoolean("adaptive_color", false)).apply()
+            render(Page.SETTINGS)
+        }
+        body.addView(adaptive, LinearLayout.LayoutParams(dp(450), dp(53)))
+        body.addView(space(11))
+        body.addView(label("Прозрачность luGlass: ${transparency()}%", 15f, Color.WHITE, true))
+        val glassSlider = SeekBar(this).apply {
+            max = 100
+            progress = transparency()
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) pref.edit().putInt("glass_transparency", progress).apply()
+                }
+                override fun onStopTrackingTouch(seekBar: SeekBar?) { render(Page.SETTINGS) }
+            })
+        }
+        body.addView(glassSlider, LinearLayout.LayoutParams(-1, dp(44)))
+        body.addView(label("Скорость анимаций: ${pref.getInt("motion_speed",100)}%", 15f, Color.WHITE, true))
+        val speedSlider = SeekBar(this).apply {
+            max = 110
+            progress = pref.getInt("motion_speed",100).coerceIn(50,160) - 50
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) pref.edit().putInt("motion_speed", progress + 50).apply()
+                }
+                override fun onStopTrackingTouch(seekBar: SeekBar?) { render(Page.SETTINGS) }
+            })
+        }
+        body.addView(speedSlider, LinearLayout.LayoutParams(-1, dp(44)))
+        body.addView(space(10))
+        val switches = row()
+        switches.addView(chip("Анимации: " + if (motionEnabled()) "ВКЛ" else "ВЫКЛ") {
+            pref.edit().putBoolean("motion_enabled", !motionEnabled()).apply()
+            render(Page.SETTINGS)
+        }, LinearLayout.LayoutParams(0, dp(51), 1f))
+        switches.addView(spacing(11))
+        switches.addView(chip("Переходы: " + if (pref.getBoolean("page_transitions", true)) "ВКЛ" else "ВЫКЛ") {
+            pref.edit().putBoolean("page_transitions", !pref.getBoolean("page_transitions", true)).apply()
+            render(Page.SETTINGS)
+        }, LinearLayout.LayoutParams(0, dp(51), 1f))
+        switches.addView(spacing(11))
+        switches.addView(chip("Сброс оформления") {
+            pref.edit().remove("glass_transparency").remove("motion_speed")
+                .remove("adaptive_color").remove("motion_enabled")
+                .remove("page_transitions").apply()
+            render(Page.SETTINGS)
+        }, LinearLayout.LayoutParams(0, dp(51), 1f))
+        body.addView(switches)
         body.addView(space(20))
         body.addView(section("Персонализация и система"))
         val buttons = row()
@@ -986,12 +1267,141 @@ class LumaHomeActivity : Activity() {
             render(Page.SETTINGS)
         }
         body.addView(rotation, LinearLayout.LayoutParams(dp(430), dp(51)))
+        body.addView(space(21))
+        body.addView(section("Комфорт и доступность"))
+        val accessibility = row()
+        accessibility.addView(chip("Размер текста: ${pref.getInt("text_scale",100)}%") {
+            customMenu("Размер текста", listOf(
+                "Обычный — 100%" to { pref.edit().putInt("text_scale",100).apply(); render(Page.SETTINGS) },
+                "Увеличенный — 115%" to { pref.edit().putInt("text_scale",115).apply(); render(Page.SETTINGS) },
+                "Крупный — 130%" to { pref.edit().putInt("text_scale",130).apply(); render(Page.SETTINGS) }
+            ))
+        }, LinearLayout.LayoutParams(0, dp(55), 1f))
+        accessibility.addView(spacing(12))
+        accessibility.addView(chip("Контраст: " + if (pref.getBoolean("high_contrast",false)) "ВЫСОКИЙ" else "ОБЫЧНЫЙ") {
+            pref.edit().putBoolean("high_contrast", !pref.getBoolean("high_contrast",false)).apply()
+            render(Page.SETTINGS)
+        }, LinearLayout.LayoutParams(0, dp(55), 1f))
+        accessibility.addView(spacing(12))
+        accessibility.addView(chip("Формат часов") {
+            customMenu("Время на главном экране", listOf(
+                "Как в настройках Android" to { pref.edit().putString("clock_mode","system").apply(); render(Page.SETTINGS) },
+                "24-часовой" to { pref.edit().putString("clock_mode","24").apply(); render(Page.SETTINGS) },
+                "12-часовой" to { pref.edit().putString("clock_mode","12").apply(); render(Page.SETTINGS) }
+            ))
+        }, LinearLayout.LayoutParams(0, dp(55), 1f))
+        body.addView(accessibility)
+        body.addView(space(14))
+        val extra = row()
+        extra.addView(chip("Таймер заставки: ${pref.getInt("ambient_delay",90)} сек") {
+            customMenu("Когда включать luAmbient?", listOf(
+                "Через 30 секунд" to { setAmbientDelay(30) },
+                "Через 90 секунд" to { setAmbientDelay(90) },
+                "Через 3 минуты" to { setAmbientDelay(180) },
+                "Через 5 минут" to { setAmbientDelay(300) }
+            ))
+        }, LinearLayout.LayoutParams(0, dp(52), 1f))
+        extra.addView(spacing(12))
+        extra.addView(chip("Сбросить приложения на главном") {
+            customMenu("Вернуть главный экран?", listOf(
+                "Да, восстановить исходный порядок" to {
+                    pref.edit().remove("pinned").apply()
+                    render(Page.SETTINGS)
+                },
+                "Отмена" to { render(Page.SETTINGS) }
+            ))
+        }, LinearLayout.LayoutParams(0, dp(52), 1f))
+        extra.addView(spacing(12))
+        extra.addView(chip("Очистить недавние") {
+            customMenu("Очистить историю Luma TV?", listOf(
+                "Очистить" to { pref.edit().remove("recents").apply(); render(Page.SETTINGS) },
+                "Отмена" to { render(Page.SETTINGS) }
+            ))
+        }, LinearLayout.LayoutParams(0, dp(52), 1f))
+        body.addView(extra)
+        body.addView(space(13))
+        body.addView(chip("ⓘ  Сведения об устройстве и luDOS") { render(Page.INFO) },
+            LinearLayout.LayoutParams(-1, dp(50)))
         body.addView(space(18))
-        body.addView(label("Luma TV 7.0  •  Kotlin + Android SDK  •  luDOS 1.0\n" +
+        body.addView(label("Luma TV 8.1  •  Kotlin + Android SDK  •  luDOS 2.0\n" +
             "Для Android TV / Google TV и совместимых устройств. " +
             "ULTRA использует размытую копию выбранных обоев; без системного blur-behind.",
             14f, 0xFFD7E6F6.toInt()))
         mainFocus = perf.getChildAt(0)
+    }
+
+    private fun setAmbientDelay(seconds: Int) {
+        pref.edit().putInt("ambient_delay", seconds).apply()
+        resetAmbientTimer()
+        render(Page.SETTINGS)
+    }
+
+    private fun isNetworkConnected(): String {
+        return try {
+            val manager = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
+            @Suppress("DEPRECATION")
+            val connected = manager?.activeNetworkInfo?.isConnected == true
+            if (connected) "Сеть подключена" else "Нет активного подключения"
+        } catch (_: Exception) { "Состояние сети недоступно" }
+    }
+
+    private fun systemInfoPage() {
+        val body = pageContent()
+        header(body, "О системе и устройстве", back = true)
+        val info = column().apply {
+            setPadding(dp(26), dp(22), dp(26), dp(22))
+            background = glass(opaque = true)
+        }
+        val manager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        val memory = ActivityManager.MemoryInfo()
+        manager.getMemoryInfo(memory)
+        val storage = StatFs(filesDir.absolutePath)
+        val facts = listOf(
+            "Luma TV 8.1  •  luDOS 2.0",
+            "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
+            "Режим: ${performanceName()}",
+            "Оперативная память: свободно ${memory.availMem / 1048576L} МБ / ${memory.totalMem / 1048576L} МБ",
+            "Внутренняя память: доступно ${storage.availableBytes / 1048576L} МБ",
+            isNetworkConnected(),
+            "Доступно приложений: ${listOfApps().count { it.pkg !in hidden() }}"
+        )
+        facts.forEach { fact ->
+            info.addView(label(fact, 18f, Color.WHITE))
+            info.addView(space(13))
+        }
+        body.addView(info)
+        body.addView(space(14))
+        body.addView(chip("Открыть системные настройки") { openSettings(Settings.ACTION_SETTINGS) },
+            LinearLayout.LayoutParams(-1, dp(55)))
+        mainFocus = body.getChildAt(body.childCount - 1)
+    }
+
+    private fun helpPage() {
+        val body = pageContent()
+        header(body, "Помощь и управление", back = true)
+        val tips = listOf(
+            "◀ ▶ ▲ ▼  — перемещение между плитками",
+            "OK — открыть выбранную карточку или приложение",
+            "Удерживать OK — закрепить, переместить или скрыть приложение",
+            "Назад — вернуться к главному экрану Luma TV",
+            "Все приложения — поиск, сортировка, фильтр Видео/Игры",
+            "Скрытые — вернуть приложения в общую библиотеку",
+            "luStudio — темы, стекло, режим LITE / BALANCED / ULTRA",
+            "luNature — выбрать из девяти встроенных обоев",
+            "luAmbient — уменьшает видимость меню при бездействии",
+            "Не удаляй системный лаунчер: вернуться к нему можно через настройки Android"
+        )
+        for (tip in tips) {
+            val card = label(tip, 17f, Color.WHITE).apply {
+                setPadding(dp(20), dp(18), dp(20), dp(18))
+                background = glass(opaque = true)
+            }
+            body.addView(card, LinearLayout.LayoutParams(-1, -2))
+            body.addView(space(10))
+        }
+        val button = chip("Перейти в luStudio") { render(Page.SETTINGS) }
+        body.addView(button, LinearLayout.LayoutParams(-1, dp(54)))
+        mainFocus = button
     }
 
     private fun quickPanel() {
@@ -1002,17 +1412,20 @@ class LumaHomeActivity : Activity() {
             "◉  Wi-Fi / сеть" to { openSettings(Settings.ACTION_WIFI_SETTINGS) },
             "⚙  Настройки телевизора" to { openSettings(Settings.ACTION_SETTINGS) },
             "▧  Обои" to { render(Page.WALLPAPERS) },
-            "✦  Настройки luDOS" to { render(Page.SETTINGS) },
-            "▦  Все приложения" to { render(Page.APPS) }
+            "✦  luStudio / Настройки luDOS" to { render(Page.SETTINGS) },
+            "▦  Все приложения" to { render(Page.APPS) },
+            "▣  Скрытые приложения" to { render(Page.HIDDEN) },
+            "ⓘ  Сведения об устройстве" to { render(Page.INFO) },
+            "⌨  Помощь по пульту" to { render(Page.HELP) }
         )
         for ((name, action) in buttonList) {
             body.addView(chip(name, action), LinearLayout.LayoutParams(-1, dp(55)))
             body.addView(space(9))
         }
         body.addView(space(15))
-        body.addView(label("Android ${Build.VERSION.RELEASE}  •  luDOS 1.0  •  Luma TV 7.0",
+        body.addView(label("Android ${Build.VERSION.RELEASE}  •  luDOS 2.0  •  Luma TV 8.1",
             14f, 0xFFE3EBFF.toInt()))
-        mainFocus = body.getChildAt(3)
+        mainFocus = body.findFocus() ?: body.getChildAt(3)
     }
 
     private fun welcome() {
@@ -1025,11 +1438,11 @@ class LumaHomeActivity : Activity() {
             background = glass(opaque = true)
         }
         val (title, sub) = when (wizardStep) {
-            0 -> "Luma TV 7.0" to "Новый стеклянный главный экран для Android TV и Google TV."
+            0 -> "Luma TV 8.1" to "Новый стеклянный главный экран для Android TV и Google TV."
             1 -> "Цвет твоего стекла" to "Выбери оттенок luGlass, который нравится именно тебе."
-            2 -> "Обои, которые вдохновляют" to "Выбери один из пяти пейзажей Luma TV."
+            2 -> "Обои, которые вдохновляют" to "Коллекция Luma TV: ${wallpaperIds.size} обоев — природа и градиенты."
             3 -> "Только нужные приложения" to "YouTube и Play Маркет появятся первыми, если они установлены. Остальное можно менять."
-            4 -> "Три режима luGlass" to "LITE для слабых, BALANCED для средних и ULTRA для мощных телевизоров."
+            4 -> "Три режима luGlass" to "LITE, BALANCED или ULTRA — каждый режим можно включить на любом совместимом телевизоре."
             else -> "Почти готово!" to "Можно сделать Luma TV главным экраном — только если прошивка телевизора это разрешает."
         }
         intro.addView(label("ШАГ ${wizardStep + 1} ИЗ 6", 14f, accent(), true))
@@ -1062,10 +1475,10 @@ class LumaHomeActivity : Activity() {
                     focusableGlass(v, 16f, pref.getInt("wallpaper", 0) == i, focusScale = 1.01f) {
                         pref.edit().putInt("wallpaper", i).apply(); refreshBackground(); render(Page.WELCOME)
                     }
-                    r.addView(v, LinearLayout.LayoutParams(0, dp(124), 1f))
-                    r.addView(spacing(10))
+                    r.addView(v, LinearLayout.LayoutParams(dp(172), dp(125)))
+                    r.addView(spacing(12))
                 }
-                body.addView(r)
+                body.addView(hscroll(r), LinearLayout.LayoutParams(-1, dp(152)))
             }
             3 -> {
                 val r = row()

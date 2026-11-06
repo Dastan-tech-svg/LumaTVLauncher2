@@ -16,7 +16,7 @@ import android.view.View
 import kotlin.math.max
 
 /**
- * luGlass ULTRA — an Android 5+ wallpaper-aware glass surface.
+ * luGlass 2.0 ULTRA — an Android 5+ wallpaper-aware glass surface.
  *
  * Only the launcher wallpaper is sampled. This is a cached *static* frost blur, not
  * a claim of system-wide real-time iOS/tvOS refraction. There are no WebViews,
@@ -29,6 +29,7 @@ internal class LuGlassDrawable(
     private val accent: Int,
     private val blurredWallpaper: Bitmap?,
     private val solid: Boolean = false,
+    private val transparency: Int = 65,
 ) : Drawable() {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val location = IntArray(2)
@@ -54,6 +55,7 @@ internal class LuGlassDrawable(
             else if (selected) intArrayOf(0x63FFFFFF, 0x280F3455, 0x6205132A)
             else intArrayOf(0x42FFFFFF, 0x0F233A55, 0x37061428),
             null, Shader.TileMode.CLAMP)
+        if (!solid) paint.alpha = (235 - transparency.coerceIn(0,100) * 1.45).toInt().coerceIn(70,235)
         canvas.drawRoundRect(rect, round, round, paint)
 
         // An edge-lit, elliptical reflective highlight at the top-left.
@@ -132,7 +134,7 @@ internal class LuGlassDrawable(
             y1.toInt().coerceIn(1, blurred.height))
         if (src.width() <= 0 || src.height() <= 0) return
         paint.resetForGlass()
-        paint.alpha = if (selected) 242 else 229
+        paint.alpha = (if (selected) 225 else 210) - transparency.coerceIn(0,100) * 2
         canvas.drawBitmap(blurred, src, rect, paint)
     }
 

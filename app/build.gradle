@@ -11,8 +11,8 @@ android {
         applicationId 'com.lumatv.launcher'
         minSdk 21
         targetSdk 32
-        versionCode 13
-        versionName '7.0'
+        versionCode 21
+        versionName '8.1'
     }
 
     buildTypes {
